@@ -1,0 +1,349 @@
+#!/usr/bin/env python
+#
+#  doligo
+#   - simple batch job scheduler
+#
+# Copyright (c) 2012 Hyeshik Chang <hyeshik@snu.ac.kr>.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+# OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+#
+
+import redis
+from Crypto.Cipher import AES
+import hashlib
+import time
+import getpass
+import pickle
+import optparse
+import subprocess
+import ConfigParser
+import os
+import re
+
+
+CONFIG_FILE = '%s/.doligo.conf' % os.environ['HOME']
+DEFAULT_CONFIG = """\
+[doligo]
+queue_prefix = doligo:      ; redis key for queue
+queue_suffix =              ; default to system user name
+redis_server = localhost    ; host name or IP address for redis server
+key          = secret       ; encryption key for job information
+
+[worker]
+VAR1         = value1       ; command line replacement for runners
+"""
+
+
+def get_cores():
+    return int(os.popen("cat /proc/cpuinfo|grep '^processor'|wc -l").read())
+
+
+class QueueServer(object):
+
+    replacement_pattern = re.compile('%%([A-Za-z_]+)%%')
+
+    def __init__(self, host, queuename, key, replacements={}):
+        self.serv = redis.Redis(host)
+        self.queue = queuename
+        self.replacements = replacements
+
+        ikey = (hashlib.md5(key).digest() + hashlib.sha1(key).digest())[:32]
+        self.cipher = AES.new(ikey)
+
+    def push(self, job):
+        return self.serv.rpush(self.queue, self.encode_job(job))
+
+    def get_job(self, jobname):
+        for job in self.get_all_jobs():
+            if job['name'] == jobname:
+                return job
+        raise KeyError('Job %s not found' % repr(jobname))
+
+    def get_all_jobs(self):
+        njobs = self.serv.llen(self.queue)
+        return map(self.decode_job, self.serv.lrange(self.queue, 0, njobs))
+
+    def pop_job(self):
+        r = self.serv.lpop(self.queue)
+        if r is not None:
+            return self.decode_job(r)
+        else:
+            return None
+
+    def push_job(self, job, head=False):
+        if head:
+            push = self.serv.lpush
+        else:
+            push = self.serv.rpush
+
+        push(self.queue, self.encode_job(job))
+
+    def flush(self):
+        self.serv.delete(self.queue)
+
+    def encode_job(self, job):
+        pjob = pickle.dumps(job)
+        pjob += '\x00' * (16 - len(pjob) % 16) # align to 16 bytes for AES
+        return self.cipher.encrypt(pjob)
+
+    def decode_job(self, encrypted_job):
+        return pickle.loads(self.cipher.decrypt(encrypted_job))
+
+    def loop(self, interval=60):
+        while True:
+            job = self.pop_job()
+            if job is None:
+                time.sleep(interval)
+                continue
+
+            try:
+                self.run_job(job)
+            except KeyboardInterrupt:
+                self.push_job(job, head=True)
+                print 'Interrupted.'
+                raise SystemExit
+
+    def replace_cmd(self, cmd):
+        return self.replacement_pattern.sub(
+            lambda m: self.replacements[m.groups()[0]], cmd)
+
+    def run_job(self, job):
+        opts = {'shell': True, 'stdin': None, 'stderr': None, 'stdout': None}
+        if 'stdin' in job:
+            opts['stdin'] = open(job['stdin'])
+        if 'stdout' in job:
+            opts['stdout'] = open(job['stdout'], 'w')
+
+        if 'stderr' in job and job.get('stdout') != job['stderr']:
+            opts['stderr'] = open(job['stderr'], 'w')
+        else:
+            opts['stderr'] = opts['stdout']
+
+        try:
+            if 'result_code' in opts:
+                result_file = open(opts['result_code'], 'w')
+            else:
+                result_file = open('/dev/null', 'w')
+
+            self.message('Job %s started.' % job['name'])
+            st = time.time()
+            subprocess.check_call(self.replace_cmd(job['command']), **opts)
+        except subprocess.CalledProcessError, exc:
+            tmconsumed = time.time() - st
+            self.message('Job %s terminated with error %d. (%.1f seconds)' % (
+                            job['name'], exc.returncode, tmconsumed))
+            print >> result_file, exc.returncode
+        except KeyboardInterrupt:
+            self.message('User interrupted job %s.' % job['name'])
+            for k in ('stdout', 'stderr', 'result_code'):
+                if k in job and os.path.exists(job[k]):
+                    os.unlink(job[k])
+            raise KeyboardInterrupt
+        else:
+            tmconsumed = time.time() - st
+            self.message('Job %s is finished. (%.1f seconds)' % (
+                            job['name'], tmconsumed))
+            print >> result_file, 0
+
+    def message(self, msg):
+        print '[%s] %s' % (time.asctime(), msg)
+
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        origmask = os.umask(077)
+        open(CONFIG_FILE, 'w').write(DEFAULT_CONFIG)
+        os.umask(origmask)
+
+    cfg = ConfigParser.ConfigParser()
+    cfg.optionxform = str
+    cfg.read(CONFIG_FILE)
+    replacements = {}
+    for opt in cfg.options('worker'):
+        replacements[opt] = cfg.get('worker', opt).split(';')[0]
+
+    return {
+        'queue_prefix': cfg.get('doligo', 'queue_prefix').split(';')[0],
+        'queue_suffix': cfg.get('doligo', 'queue_suffix').split(';')[0],
+        'redis_server': cfg.get('doligo', 'redis_server').split(';')[0],
+        'key': cfg.get('doligo', 'key').split(';')[0],
+        'replacements': replacements,
+    }
+
+
+def parse_options_add():
+    parser = optparse.OptionParser()
+    parser.add_option("-i", "--stdin", dest="stdin", default=None,
+            help="feed stdin from FILE", metavar="FILE")
+    parser.add_option("-o", "--stdout", dest="stdout", default=None,
+            help="write stdout to FILE", metavar="FILE")
+    parser.add_option("-e", "--stderr", dest="stderr", default=None,
+            help="write stderr to FILE", metavar="FILE")
+    parser.add_option("-r", "--result", dest="result_code", default=None,
+            help="write result code to FILE", metavar="FILE")
+    parser.add_option("-n", "--name", dest="name", default=None,
+            help="set job's name", metavar="NAME")
+    parser.usage = "%prog [options] {shell command}"
+
+    (options, args) = parser.parse_args()
+    if len(args) < 1:
+        parser.print_help()
+        raise SystemExit
+
+    job = {'command': args[0]}
+    if options.stdin is not None:
+        job['stdin'] = options.stdin
+    if options.stdout is not None:
+        job['stdout'] = options.stdout
+    if options.stderr is not None:
+        job['stderr'] = options.stderr
+    if options.result_code is not None:
+        job['result_code'] = options.result_code
+    if options.name is not None:
+        job['name'] = options.name
+    else:
+        job['name'] = 'job-%.5f' % (time.time())
+
+    job['added'] = time.time()
+
+    return job
+
+
+def parse_options_status():
+    parser = optparse.OptionParser()
+    parser.usage = "%prog [name]"
+    (options, args) = parser.parse_args()
+    return args
+
+
+def parse_options_flush():
+    parser = optparse.OptionParser()
+    parser.usage = "%prog"
+    (options, args) = parser.parse_args()
+    return args
+
+
+def parse_options_run():
+    parser = optparse.OptionParser()
+    parser.add_option("-i", "--interval", dest="interval", default='60',
+            help="interval between job polling", metavar="SECONDS")
+    parser.usage = "%prog [options] [REPLACE_KEYWORD=string] ..."
+
+    (options, args) = parser.parse_args()
+
+    return {
+        'interval': float(options.interval),
+        'replacements': dict(arg.split('=') for arg in args),
+    }
+
+
+def print_global_help():
+    print """\
+Usage: %s command [options] ...
+
+Commands:
+  add         Add new job to queue
+  run         Run jobs in queue
+  flush       Remove all jobs from queue
+  status      Show status of jobs in queue
+""" % sys.argv[0]
+
+
+def run_status(qserver, jobnames):
+    alljobs = qserver.get_all_jobs()
+    print 'Total %d job(s) are waiting in queue' % len(alljobs)
+    print
+
+    if not jobnames:
+        selectedjobs = alljobs
+    else:
+        alljobsmap = dict((j['name'], j) for j in alljobs)
+        selectedjobs = [alljobsmap.get(name, name) for name in jobnames]
+
+    for job in selectedjobs:
+        if isinstance(job, str):
+            print '%s not found.' % job
+        else:
+            print '%s: queued %d second(s) ago' % (job['name'],
+                    int(time.time() - job['added']))
+            if jobnames: # show more information for specified jobs
+                print '\t[command] %s' % job['command']
+                print '\t[stdout] %s' % job.get('stdout')
+                print '\t[stderr] %s' % job.get('stderr')
+                print '\t[result code] %s' % job.get('result_code')
+                print
+
+
+def run_add(qserver, job):
+    qserver.push_job(job)
+    print 'Job %s is scheduled.' % job['name']
+
+
+def run_flush(qserver):
+    qserver.flush()
+    print 'Flushed.'
+
+
+def run_run(qserver, options):
+    if 'NCORES' not in options['replacements']:
+        options['replacements']['NCORES'] = str(get_cores())
+
+    qserver.replacements.update(options['replacements'])
+    qserver.loop(options['interval'])
+
+
+if __name__ == '__main__':
+    import getpass
+    import sys
+
+    cfg = load_config()
+
+    if len(sys.argv) < 2:
+        print_global_help()
+        raise SystemExit
+
+    command = sys.argv.pop(1)
+    sys.argv[0] += ' ' + command
+    queuename = cfg['queue_prefix'] + (
+                    cfg['queue_suffix'] if cfg['queue_suffix']
+                                        else getpass.getuser())
+
+    qserver = QueueServer(cfg['redis_server'], queuename,
+                          cfg['key'], cfg['replacements'])
+
+    if command == 'add':
+        job = parse_options_add()
+        run_add(qserver, job)
+    elif command == 'status':
+        names = parse_options_status()
+        run_status(qserver, names)
+    elif command == 'run':
+        options = parse_options_run()
+        run_run(qserver, options)
+    elif command == 'flush':
+        names = parse_options_flush()
+        run_flush(qserver)
+    else:
+        print 'Command %s is unsupported.' % command
+        print
+        print_global_help()
+        sys.exit(1)
+
+
+# ex: sts=4 sw=4 et sm
