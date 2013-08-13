@@ -1,0 +1,228 @@
+#!/usr/bin/env python
+#
+# dualdeg-strip:
+#  adapter sequence stripper for dual degenerative sequence tagged small RNA libraries
+#
+# Copyright (c) 2013 Hyeshik Chang
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# - Hyeshik Chang <hyeshik@snu.ac.kr>
+#
+
+import glob
+import os
+import io
+import sys
+import csv
+import tempfile
+import shutil
+import subprocess as sp
+import futures
+from itertools import chain
+from functools import partial
+from Bio import SeqIO
+
+
+class TemporaryDirectory(object):
+    def __init__(self, dir='.'):
+        self.dir = dir
+        self.path = None
+
+    def __enter__(self):
+        self.path = tempfile.mkdtemp(dir=self.dir)
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if self.path is not None:
+            shutil.rmtree(self.path)
+
+    def all_files(self, prefix=''):
+        return sorted(glob.glob(os.path.join(self.path, prefix + '*')))
+
+    def __iter__(self):
+        return chain(*map(open, self.all_files()))
+
+
+def is_gzipped(filename):
+    return open(filename).read(2) == '\x1f\x8b'
+
+
+#cat tmp*/footprint-*|sort -k4,4 -k3,3nr -k4,4n|uniq -f 3 --all-repeated=separate|cut -f1 > repeated
+#sort --parallel=32 -k6,6 -k3,3nr -k4,4n tmp*/footprint-* > full
+
+def generate_footprints(options, inpf, outf):
+    rand5len, rand3len = options.rand5len, options.rand3len
+    delim5, delim3 = options.delim5, options.delim3
+
+    delim5len = len(delim5)
+    delim3len = len(delim3)
+
+    fpbegin, fpend = map(int, options.footprint_region.split(':'))
+    fpbegin -= 1
+
+    output = open(outf, 'w')
+
+    for seq in SeqIO.parse(open(inpf), 'fastq'):
+        s = str(seq.seq)
+
+        ibegin = rand5len
+        iend = len(s) - rand3len
+
+        if delim5len:
+            for offset in (0, -1, 1):
+                dseq = s[ibegin + offset:ibegin + offset + delim5len]
+                if dseq == delim5:
+                    break
+            else:
+                continue # no 5' delimiter match
+
+            ibegin += delim5len + offset
+
+        if delim3len:
+            for offset in (0, -1, 1):
+                dseq = s[iend + offset - delim3len:iend + offset]
+                if dseq == delim3:
+                    break
+            else:
+                continue # no 3' delimiter match
+
+            iend -= delim3len - offset
+
+        if iend <= ibegin:
+            continue
+
+        iseq = s[ibegin:iend]
+        fpseq = s[:rand5len] + s[-rand3len:] + iseq[fpbegin:fpend]
+        qual = seq.letter_annotations['phred_quality'][ibegin:iend]
+        qualmin = min(qual)
+        qualsum = sum(qual)
+        qualstr = ''.join(chr(qv + 33) for qv in qual)
+
+        print >> output, '\t'.join([seq.name, str(qualmin), str(qualsum), iseq, qualstr, fpseq])
+
+
+def merge_unique_sequences(options, footprints):
+    subproccmd = ("sort --parallel={options.parallel} -k6,6 -k3,3nr -k4,4n ".format(
+                        options=options) +
+                  " ".join("'{}'".format(f) for f in footprints) +
+                  " | uniq -f5")
+    subproc = sp.Popen(subproccmd, shell=True, stdout=sp.PIPE)
+    writer = io.BufferedWriter(io.open('/dev/stdout', 'wb'))
+
+    for line in subproc.stdout:
+        writer.write("@{f[0]}\n{f[3]}\n+\n{f[4]}\n".format(f=line.split('\t')))
+
+    writer.flush()
+
+
+def write_statistics(options, footprints):
+    output = csv.writer(open(options.output_stats, 'w'))
+
+    subproccmd = ("sort --parallel={options.parallel} -k6,6 ".format(options=options) +
+                  " ".join("'{}'".format(f) for f in footprints) +
+                  " | cut -f6 | uniq -c | awk '{print $1}' | sort -n | uniq -c")
+
+    output.writerow(('Number of duplicates', 'Count'))
+
+    for line in sp.check_output(subproccmd, shell=True).splitlines():
+        count, ndups = line.split()
+        output.writerow((ndups, count))
+
+
+def main(options):
+    if options.input[0] == '-':
+        inputcmd = ''
+    elif is_gzipped(options.input[0]):
+        inputcmd = 'gzip -dc "{}" | '.format(options.input[0])
+    else:
+        inputcmd = 'cat "{}" | '.format(options.input[0])
+
+    with TemporaryDirectory(options.tmpdir) as tmpdir:
+        # call cutadapt via echidna to strip 3' adapter sequences
+        output_prefix = os.path.join(tmpdir.path, 'a3cut-')
+
+        subproccmd = ("{inputcmd} echidna -p {options.parallel} -i fastq -o fastq -c "
+                      "'cutadapt -a \"{options.adapter3}\" -f fastq {options.cutadapt_args} "
+                      " - > {output_prefix}$$ 2>/dev/null' "
+                      ).format(options=options, inputcmd=inputcmd, output_prefix=output_prefix)
+
+        sp.check_call(subproccmd, shell=True)
+
+        # generate sequence footprints for duplicity check
+        processed_files = tmpdir.all_files('a3cut-')
+
+        with futures.ProcessPoolExecutor(min(len(processed_files), options.parallel)) as pool:
+            jobs = []
+
+            for inpf in processed_files:
+                outf = os.path.join(tmpdir.path, 'footprint-' + inpf.split('-', 1)[1])
+                job = pool.submit(generate_footprints, options, inpf, outf)
+                jobs.append(job)
+
+            for job in jobs:
+                job.result()
+
+        # merge generated footprints, remove duplicates and write them in fastq format
+        merge_unique_sequences(options, tmpdir.all_files('footprint-'))
+
+        # write statistics of duplicity
+        if options.output_stats:
+            write_statistics(options, tmpdir.all_files('footprint-'))
+
+
+def parse_arguments():
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Strips dual-tagged degenerative sequences'
+                    ' in small RNA libraries. This program requires echidna and cutadapt in'
+                    ' PATH.')
+    parser.add_argument(dest='input', type=str, nargs=1, help='Input FASTQ file (- for stdin)')
+    parser.add_argument('-a', '--adapter3', dest='adapter3', metavar='SEQ', type=str,
+                    required=True,
+                    help='Sequence of the fixed part of 3\' adapter (required)')
+    parser.add_argument('--rand5', dest='rand5len', metavar='LEN', type=int, default=0,
+                    help='Expected length of random sequence on the 5\' adapter (default: 0)')
+    parser.add_argument('--rand3', dest='rand3len', metavar='LEN', type=int, default=0,
+                    help='Expected length of random sequence on the 3\' adapter (default: 0)')
+    parser.add_argument('--delim5', dest='delim5', metavar='SEQ', type=str, default='',
+                    help='Delimiter sequence next to the 5\' adapter (default: null)')
+    parser.add_argument('--delim3', dest='delim3', metavar='SEQ', type=str, default='',
+                    help='Delimiter sequence next to the 3\' adapter (default: null)')
+    parser.add_argument('--footprint-region', dest='footprint_region',
+                    type=str, metavar='start:end', default='1:15',
+                    help='Interval of insert sequences for duplicate removal '
+                         '(1-based coordinates after adapter removal)')
+    parser.add_argument('--cutadapt-args', dest='cutadapt_args', metavar='STR', type=str,
+                    default='--trimmed-only --minimum-length=15',
+                    help='Additional arguments to be passed to cutadapt '
+                         '(default: --trimmed-only --minimum-length=15)')
+    parser.add_argument('--output-stats', dest='output_stats', metavar='FILE', type=str,
+                    default=None, help='Write statistics for duplicity')
+    parser.add_argument('--tmpdir', dest='tmpdir', metavar='DIR', type=str,
+                    default='.', help='Path to store temporary data')
+    parser.add_argument('--parallel', dest='parallel', metavar='N', type=int,
+                    default=32, help='Number of parallel processors (default: 32)')
+
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    main(parse_arguments())
+
