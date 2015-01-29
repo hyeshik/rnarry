@@ -158,10 +158,15 @@ def main(options):
         # call cutadapt via echidna to strip 3' adapter sequences
         output_prefix = os.path.join(tmpdir.path, 'a3cut-')
 
-        subproccmd = ("{inputcmd} echidna -p {options.parallel} -i fastq -o fastq -c "
-                      "'cutadapt -a \"{options.adapter3}\" -f fastq {options.cutadapt_args} "
-                      " - > {output_prefix}$$ 2>/dev/null' "
-                      ).format(options=options, inputcmd=inputcmd, output_prefix=output_prefix)
+        if options.adapter3 is not None:
+            subproccmd = (
+                "{inputcmd} echidna -p {options.parallel} -i fastq -o fastq -c "
+                "'cutadapt -a \"{options.adapter3}\" -f fastq {options.cutadapt_args} "
+                " - > {output_prefix}$$ 2>/dev/null' "
+                ).format(options=options, inputcmd=inputcmd, output_prefix=output_prefix)
+        else:
+            subproccmd = "{inputcmd} cat - > {output_prefix}$$".format(
+                            inputcmd=inputcmd, output_prefix=output_prefix)
 
         sp.check_call(subproccmd, shell=True)
 
@@ -195,7 +200,7 @@ def parse_arguments():
                     ' PATH.')
     parser.add_argument(dest='input', type=str, nargs=1, help='Input FASTQ file (- for stdin)')
     parser.add_argument('-a', '--adapter3', dest='adapter3', metavar='SEQ', type=str,
-                    required=True,
+                    default=None,
                     help='Sequence of the fixed part of 3\' adapter (required)')
     parser.add_argument('--rand5', dest='rand5len', metavar='LEN', type=int, default=0,
                     help='Expected length of random sequence on the 5\' adapter (default: 0)')
